@@ -1,0 +1,1640 @@
+# ============================================================
+# JARVIS - COMPLETE WINDOWS DESKTOP ASSISTANT
+# Python 3.12
+# ============================================================
+
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+import threading
+import os
+import json
+import datetime
+import logging
+import webbrowser
+import operator
+import ast
+import subprocess
+import urllib.parse
+import time
+
+# Optional / external packages
+import pyttsx3
+import speech_recognition as sr
+import psutil
+from PIL import ImageGrab
+import ollama
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_NAME = "J.A.R.V.I.S"
+MODEL = "llama3.2:3b"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
+NOTES_FILE = os.path.join(BASE_DIR, "jarvis_notes.txt")
+LOG_FILE = os.path.join(BASE_DIR, "jarvis.log")
+
+OLLAMA_HOST = "http://127.0.0.1:11434"
+
+SYSTEM_PROMPT = """
+You are JARVIS, a helpful desktop AI assistant.
+
+Rules:
+- Address the user as Sir.
+- Be natural and helpful.
+- Keep answers reasonably short unless more detail is requested.
+- Do not invent facts.
+- If you are unsure, say so.
+- Remember useful previous conversation context.
+"""
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+# ============================================================
+# TEXT TO SPEECH
+# ============================================================
+
+try:
+    engine = pyttsx3.init()
+
+    engine.setProperty("rate", 180)
+    engine.setProperty("volume", 1.0)
+
+    voices = engine.getProperty("voices")
+
+    if voices:
+        engine.setProperty("voice", voices[0].id)
+
+    TTS_AVAILABLE = True
+
+except Exception as e:
+    logging.exception(e)
+    TTS_AVAILABLE = False
+
+
+# ============================================================
+# SPEECH RECOGNITION
+# ============================================================
+
+recognizer = sr.Recognizer()
+
+try:
+    microphone = sr.Microphone()
+    MICROPHONE_AVAILABLE = True
+except Exception as e:
+    logging.exception(e)
+    microphone = None
+    MICROPHONE_AVAILABLE = False
+
+
+# ============================================================
+# CONVERSATION MEMORY
+# ============================================================
+
+conversation = [
+    {
+        "role": "system",
+        "content": SYSTEM_PROMPT
+    }
+]
+
+
+def load_memory():
+
+    global conversation
+
+    if not os.path.exists(MEMORY_FILE):
+        return
+
+    try:
+
+        with open(MEMORY_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if isinstance(data, list) and data:
+            conversation = data
+
+        logging.info("Memory loaded.")
+
+    except Exception as e:
+
+        logging.exception(e)
+
+        conversation = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            }
+        ]
+
+
+def save_memory():
+
+    try:
+
+        with open(MEMORY_FILE, "w", encoding="utf-8") as file:
+            json.dump(
+                conversation,
+                file,
+                indent=4,
+                ensure_ascii=False
+            )
+
+    except Exception as e:
+        logging.exception(e)
+
+
+def clear_memory():
+
+    global conversation
+
+    conversation = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT
+        }
+    ]
+
+    save_memory()
+
+
+# ============================================================
+# SAFE CALCULATOR
+# ============================================================
+
+OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def evaluate(node):
+
+    if isinstance(node, ast.Constant):
+
+        if isinstance(node.value, (int, float)):
+            return node.value
+
+        raise ValueError("Invalid value")
+
+    if isinstance(node, ast.BinOp):
+
+        operation = OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Operator not allowed")
+
+        return operation(
+            evaluate(node.left),
+            evaluate(node.right)
+        )
+
+    if isinstance(node, ast.UnaryOp):
+
+        operation = OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Operator not allowed")
+
+        return operation(
+            evaluate(node.operand)
+        )
+
+    raise ValueError("Invalid calculation")
+
+
+def calculate(expression):
+
+    tree = ast.parse(
+        expression,
+        mode="eval"
+    )
+
+    return evaluate(tree.body)
+
+
+# ============================================================
+# TEXT TO SPEECH
+# ============================================================
+
+speech_lock = threading.Lock()
+
+
+def speak(text):
+
+    text = str(text)
+
+    if not text.strip():
+        return
+
+    log_message("JARVIS", text)
+
+    if not TTS_AVAILABLE:
+        return
+
+    def speak_thread():
+
+        with speech_lock:
+
+            try:
+                engine.say(text)
+                engine.runAndWait()
+
+            except Exception as e:
+                logging.exception(e)
+
+    threading.Thread(
+        target=speak_thread,
+        daemon=True
+    ).start()
+
+
+# ============================================================
+# LOGGING / GUI
+# ============================================================
+
+def log_message(sender, message):
+
+    logging.info(f"{sender}: {message}")
+
+
+# ============================================================
+# AI
+# ============================================================
+
+def ask_ai(question):
+
+    global conversation
+
+    conversation.append(
+        {
+            "role": "user",
+            "content": question
+        }
+    )
+
+    try:
+
+        response = ollama.chat(
+            model=MODEL,
+            messages=conversation
+        )
+
+        answer = response["message"]["content"].strip()
+
+        conversation.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
+        save_memory()
+
+        return answer
+
+    except Exception as e:
+
+        logging.exception(e)
+
+        # Remove failed user message so memory does not
+        # repeatedly store unanswered requests.
+        if conversation and conversation[-1]["role"] == "user":
+            conversation.pop()
+
+        return (
+            "I cannot connect to Ollama right now, Sir. "
+            "Please make sure Ollama is running."
+        )
+
+
+# ============================================================
+# WINDOWS APPLICATIONS
+# ============================================================
+
+def open_notepad():
+
+    subprocess.Popen("notepad.exe")
+    return "Opening Notepad, Sir."
+
+
+def open_calculator():
+
+    subprocess.Popen("calc.exe")
+    return "Opening Calculator, Sir."
+
+
+def open_explorer():
+
+    subprocess.Popen("explorer.exe")
+    return "Opening File Explorer, Sir."
+
+
+def open_cmd():
+
+    subprocess.Popen("cmd.exe")
+    return "Opening Command Prompt, Sir."
+
+
+def open_powershell():
+
+    subprocess.Popen(
+        ["powershell.exe"],
+        creationflags=subprocess.CREATE_NEW_CONSOLE
+    )
+
+    return "Opening PowerShell, Sir."
+
+
+def open_paint():
+
+    subprocess.Popen("mspaint.exe")
+    return "Opening Paint, Sir."
+
+
+# ============================================================
+# WEB COMMANDS
+# ============================================================
+
+def open_google():
+
+    webbrowser.open("https://www.google.com")
+
+    return "Opening Google, Sir."
+
+
+def open_youtube():
+
+    webbrowser.open("https://www.youtube.com")
+
+    return "Opening YouTube, Sir."
+
+
+def google_search(query):
+
+    url = (
+        "https://www.google.com/search?q="
+        + urllib.parse.quote_plus(query)
+    )
+
+    webbrowser.open(url)
+
+    return f"Searching Google for {query}, Sir."
+
+
+def youtube_search(query):
+
+    url = (
+        "https://www.youtube.com/results?search_query="
+        + urllib.parse.quote_plus(query)
+    )
+
+    webbrowser.open(url)
+
+    return f"Searching YouTube for {query}, Sir."
+
+
+# ============================================================
+# TIME / DATE
+# ============================================================
+
+def tell_time():
+
+    now = datetime.datetime.now()
+
+    return (
+        "The time is "
+        + now.strftime("%I:%M %p")
+        + ", Sir."
+    )
+
+
+def tell_date():
+
+    now = datetime.datetime.now()
+
+    return (
+        "Today is "
+        + now.strftime("%A, %d %B %Y")
+        + ", Sir."
+    )
+
+
+# ============================================================
+# SYSTEM INFORMATION
+# ============================================================
+
+def battery_status():
+
+    battery = psutil.sensors_battery()
+
+    if battery is None:
+        return "Battery information is not available, Sir."
+
+    percentage = battery.percent
+
+    if battery.power_plugged:
+        state = "and the computer is connected to power"
+    else:
+        state = "and the computer is running on battery"
+
+    return (
+        f"Battery is at {percentage:.0f} percent, "
+        f"{state}, Sir."
+    )
+
+
+def system_status():
+
+    cpu = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+
+    ram_used = ram.percent
+
+    return (
+        f"CPU usage is {cpu:.0f} percent. "
+        f"Memory usage is {ram_used:.0f} percent, Sir."
+    )
+
+
+# ============================================================
+# SCREENSHOT
+# ============================================================
+
+def take_screenshot():
+
+    timestamp = datetime.datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    filename = os.path.join(
+        BASE_DIR,
+        f"jarvis_screenshot_{timestamp}.png"
+    )
+
+    try:
+
+        image = ImageGrab.grab()
+        image.save(filename)
+
+        return f"Screenshot saved as {filename}, Sir."
+
+    except Exception as e:
+
+        logging.exception(e)
+
+        return "I could not take the screenshot, Sir."
+
+
+# ============================================================
+# NOTES
+# ============================================================
+
+def save_note(text):
+
+    try:
+
+        with open(
+            NOTES_FILE,
+            "a",
+            encoding="utf-8"
+        ) as file:
+
+            timestamp = datetime.datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            file.write(
+                f"[{timestamp}] {text}\n"
+            )
+
+        return "Note saved, Sir."
+
+    except Exception as e:
+
+        logging.exception(e)
+
+        return "I could not save the note, Sir."
+
+
+def read_notes():
+
+    if not os.path.exists(NOTES_FILE):
+        return "You do not have any saved notes, Sir."
+
+    try:
+
+        with open(
+            NOTES_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            notes = file.read().strip()
+
+        if not notes:
+            return "You do not have any saved notes, Sir."
+
+        return notes
+
+    except Exception as e:
+
+        logging.exception(e)
+
+        return "I could not read the notes, Sir."
+
+
+# ============================================================
+# SPEECH INPUT
+# ============================================================
+
+def listen():
+
+    if not MICROPHONE_AVAILABLE:
+
+        return None
+
+    try:
+
+        with microphone as source:
+
+            update_status("Listening...")
+
+            recognizer.adjust_for_ambient_noise(
+                source,
+                duration=0.5
+            )
+
+            audio = recognizer.listen(
+                source,
+                timeout=5,
+                phrase_time_limit=10
+            )
+
+        update_status("Recognizing...")
+
+        text = recognizer.recognize_google(
+            audio
+        )
+
+        return text
+
+    except sr.WaitTimeoutError:
+
+        return None
+
+    except sr.UnknownValueError:
+
+        return None
+
+    except sr.RequestError:
+
+        return (
+            "Speech recognition requires an "
+            "internet connection."
+        )
+
+    except Exception as e:
+
+        logging.exception(e)
+
+        return None
+
+
+# ============================================================
+# COMMAND PROCESSOR
+# ============================================================
+
+def process_command(command):
+
+    if not command:
+        return
+
+    command = command.strip()
+
+    if not command:
+        return
+
+    display_user(command)
+
+    lower = command.lower()
+
+    # --------------------------------------------------------
+    # EXIT
+    # --------------------------------------------------------
+
+    if lower in [
+        "exit",
+        "quit",
+        "goodbye",
+        "bye",
+        "shutdown jarvis"
+    ]:
+
+        answer = "Goodbye, Sir."
+
+        display_jarvis(answer)
+        speak(answer)
+
+        root.after(
+            1800,
+            root.destroy
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # TIME
+    # --------------------------------------------------------
+
+    if lower in [
+        "time",
+        "what time is it",
+        "tell me the time"
+    ]:
+
+        answer = tell_time()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
+
+    if lower in [
+        "date",
+        "what is the date",
+        "today's date",
+        "tell me the date"
+    ]:
+
+        answer = tell_date()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # GOOGLE
+    # --------------------------------------------------------
+
+    if lower in [
+        "google",
+        "open google"
+    ]:
+
+        answer = open_google()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # YOUTUBE
+    # --------------------------------------------------------
+
+    if lower in [
+        "youtube",
+        "open youtube"
+    ]:
+
+        answer = open_youtube()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # SEARCH
+    # --------------------------------------------------------
+
+    if lower.startswith("search "):
+
+        query = command[7:].strip()
+
+        if query:
+
+            answer = google_search(query)
+
+            display_jarvis(answer)
+            speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # YOUTUBE SEARCH / PLAY
+    # --------------------------------------------------------
+
+    if lower.startswith("play "):
+
+        query = command[5:].strip()
+
+        if query:
+
+            answer = youtube_search(query)
+
+            display_jarvis(answer)
+            speak(answer)
+
+        return
+
+    if lower.startswith("youtube search "):
+
+        query = command[15:].strip()
+
+        if query:
+
+            answer = youtube_search(query)
+
+            display_jarvis(answer)
+            speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # CALCULATOR
+    # --------------------------------------------------------
+
+    if lower.startswith("calculate "):
+
+        expression = command[10:].strip()
+
+        try:
+
+            result = calculate(expression)
+
+            answer = f"The answer is {result}, Sir."
+
+        except Exception:
+
+            answer = (
+                "I could not calculate that expression, Sir."
+            )
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # APPS
+    # --------------------------------------------------------
+
+    if lower in [
+        "open notepad",
+        "notepad"
+    ]:
+
+        answer = open_notepad()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    if lower in [
+        "open calculator",
+        "calculator"
+    ]:
+
+        answer = open_calculator()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    if lower in [
+        "open file explorer",
+        "open explorer",
+        "explorer"
+    ]:
+
+        answer = open_explorer()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    if lower in [
+        "open command prompt",
+        "open cmd",
+        "cmd"
+    ]:
+
+        answer = open_cmd()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    if lower in [
+        "open powershell",
+        "powershell"
+    ]:
+
+        answer = open_powershell()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    if lower in [
+        "open paint",
+        "paint"
+    ]:
+
+        answer = open_paint()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # SCREENSHOT
+    # --------------------------------------------------------
+
+    if lower in [
+        "screenshot",
+        "take screenshot",
+        "take a screenshot"
+    ]:
+
+        answer = take_screenshot()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # BATTERY
+    # --------------------------------------------------------
+
+    if lower in [
+        "battery",
+        "battery status",
+        "check battery"
+    ]:
+
+        answer = battery_status()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # SYSTEM
+    # --------------------------------------------------------
+
+    if lower in [
+        "system status",
+        "system information",
+        "computer status"
+    ]:
+
+        answer = system_status()
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # NOTES
+    # --------------------------------------------------------
+
+    if lower.startswith("take note "):
+
+        note = command[10:].strip()
+
+        answer = save_note(note)
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    if lower.startswith("remember "):
+
+        note = command[9:].strip()
+
+        answer = save_note(note)
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    if lower in [
+        "read notes",
+        "show notes"
+    ]:
+
+        answer = read_notes()
+
+        display_jarvis(answer)
+
+        # Don't speak a huge notes file.
+        if len(answer) < 500:
+            speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # CLEAR MEMORY
+    # --------------------------------------------------------
+
+    if lower == "clear memory":
+
+        clear_memory()
+
+        answer = "Conversation memory has been cleared, Sir."
+
+        display_jarvis(answer)
+        speak(answer)
+
+        return
+
+    # --------------------------------------------------------
+    # HELP
+    # --------------------------------------------------------
+
+    if lower in [
+        "help",
+        "commands",
+        "show commands"
+    ]:
+
+        answer = (
+            "Available commands:\n\n"
+            "Time\n"
+            "Date\n"
+            "Open Google\n"
+            "Open YouTube\n"
+            "Search [query]\n"
+            "Play [song]\n"
+            "Calculate [expression]\n"
+            "Open Notepad\n"
+            "Open Calculator\n"
+            "Open Explorer\n"
+            "Open CMD\n"
+            "Open PowerShell\n"
+            "Open Paint\n"
+            "Take Screenshot\n"
+            "Battery Status\n"
+            "System Status\n"
+            "Take Note [text]\n"
+            "Read Notes\n"
+            "Clear Memory\n"
+            "Exit"
+        )
+
+        display_jarvis(answer)
+        speak(
+            "I have displayed my available commands, Sir."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # AI FALLBACK
+    # --------------------------------------------------------
+
+    update_status("Thinking...")
+
+    def ai_thread():
+
+        answer = ask_ai(command)
+
+        root.after(
+            0,
+            lambda: display_jarvis(answer)
+        )
+
+        speak(answer)
+
+        root.after(
+            0,
+            lambda: update_status("Online")
+        )
+
+    threading.Thread(
+        target=ai_thread,
+        daemon=True
+    ).start()
+
+
+# ============================================================
+# GUI FUNCTIONS
+# ============================================================
+
+def display_user(text):
+
+    chat_box.config(state="normal")
+
+    chat_box.insert(
+        tk.END,
+        "\nYOU:\n",
+        "user_label"
+    )
+
+    chat_box.insert(
+        tk.END,
+        text + "\n",
+        "user_text"
+    )
+
+    chat_box.config(state="disabled")
+    chat_box.see(tk.END)
+
+    log_message("USER", text)
+
+
+def display_jarvis(text):
+
+    chat_box.config(state="normal")
+
+    chat_box.insert(
+        tk.END,
+        "\nJARVIS:\n",
+        "jarvis_label"
+    )
+
+    chat_box.insert(
+        tk.END,
+        str(text) + "\n",
+        "jarvis_text"
+    )
+
+    chat_box.config(state="disabled")
+    chat_box.see(tk.END)
+
+    log_message("JARVIS", text)
+
+
+def update_status(text):
+
+    root.after(
+        0,
+        lambda: status_label.config(
+            text="● " + text
+        )
+    )
+
+
+def send_command(event=None):
+
+    command = input_box.get().strip()
+
+    if not command:
+        return
+
+    input_box.delete(
+        0,
+        tk.END
+    )
+
+    threading.Thread(
+        target=process_command,
+        args=(command,),
+        daemon=True
+    ).start()
+
+
+def voice_command():
+
+    if not MICROPHONE_AVAILABLE:
+
+        display_jarvis(
+            "Microphone is not available, Sir."
+        )
+
+        return
+
+    def voice_thread():
+
+        text = listen()
+
+        if text:
+
+            root.after(
+                0,
+                lambda: process_command(text)
+            )
+
+        else:
+
+            root.after(
+                0,
+                lambda: update_status("Online")
+            )
+
+    threading.Thread(
+        target=voice_thread,
+        daemon=True
+    ).start()
+
+
+# ============================================================
+# WAKE WORD MODE
+# ============================================================
+
+wake_mode = False
+wake_thread_running = False
+
+
+def toggle_wake_mode():
+
+    global wake_mode
+
+    wake_mode = not wake_mode
+
+    if wake_mode:
+
+        wake_button.config(
+            text="WAKE MODE: ON"
+        )
+
+        update_status("Wake mode active")
+
+        start_wake_listener()
+
+    else:
+
+        wake_button.config(
+            text="WAKE MODE: OFF"
+        )
+
+        update_status("Online")
+
+
+def start_wake_listener():
+
+    global wake_thread_running
+
+    if wake_thread_running:
+        return
+
+    wake_thread_running = True
+
+    threading.Thread(
+        target=wake_listener,
+        daemon=True
+    ).start()
+
+
+def wake_listener():
+
+    global wake_thread_running
+
+    while wake_mode:
+
+        try:
+
+            with microphone as source:
+
+                update_status("Waiting for Hey Jarvis...")
+
+                audio = recognizer.listen(
+                    source,
+                    timeout=5,
+                    phrase_time_limit=5
+                )
+
+            text = recognizer.recognize_google(
+                audio
+            ).lower()
+
+            logging.info(
+                f"Wake listener heard: {text}"
+            )
+
+            if (
+                "hey jarvis" in text
+                or "hey jarvis" == text
+            ):
+
+                root.after(
+                    0,
+                    lambda: display_jarvis(
+                        "Yes, Sir?"
+                    )
+                )
+
+                speak("Yes, Sir.")
+
+                time.sleep(0.5)
+
+                command = listen()
+
+                if command:
+
+                    root.after(
+                        0,
+                        lambda c=command:
+                        process_command(c)
+                    )
+
+        except Exception:
+            pass
+
+    wake_thread_running = False
+
+    update_status("Online")
+
+
+# ============================================================
+# GUI
+# ============================================================
+
+root = tk.Tk()
+
+root.title(
+    "J.A.R.V.I.S - Desktop Assistant"
+)
+
+root.geometry(
+    "1050x700"
+)
+
+root.minsize(
+    850,
+    600
+)
+
+root.configure(
+    bg="#050505"
+)
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+header = tk.Frame(
+    root,
+    bg="#050505"
+)
+
+header.pack(
+    fill="x",
+    padx=20,
+    pady=(15, 5)
+)
+
+
+title_label = tk.Label(
+    header,
+    text="J.A.R.V.I.S",
+    font=("Consolas", 30, "bold"),
+    bg="#050505",
+    fg="#00ff66"
+)
+
+title_label.pack(
+    side="left"
+)
+
+
+subtitle_label = tk.Label(
+    header,
+    text="  JUST A RATHER VERY INTELLIGENT SYSTEM",
+    font=("Consolas", 10),
+    bg="#050505",
+    fg="#00aa44"
+)
+
+subtitle_label.pack(
+    side="left",
+    pady=(13, 0)
+)
+
+
+status_label = tk.Label(
+    header,
+    text="● Starting...",
+    font=("Consolas", 11, "bold"),
+    bg="#050505",
+    fg="#00ff66"
+)
+
+status_label.pack(
+    side="right",
+    pady=(10, 0)
+)
+
+
+# ============================================================
+# SEPARATOR
+# ============================================================
+
+separator = tk.Frame(
+    root,
+    height=2,
+    bg="#00aa44"
+)
+
+separator.pack(
+    fill="x",
+    padx=20
+)
+
+
+# ============================================================
+# CHAT BOX
+# ============================================================
+
+chat_box = scrolledtext.ScrolledText(
+    root,
+    wrap=tk.WORD,
+    font=("Consolas", 12),
+    bg="#020202",
+    fg="#00ff66",
+    insertbackground="#00ff66",
+    selectbackground="#005522",
+    relief="flat",
+    borderwidth=0
+)
+
+chat_box.pack(
+    fill="both",
+    expand=True,
+    padx=20,
+    pady=15
+)
+
+chat_box.tag_config(
+    "user_label",
+    foreground="#00ccff",
+    font=("Consolas", 12, "bold")
+)
+
+chat_box.tag_config(
+    "user_text",
+    foreground="#ffffff"
+)
+
+chat_box.tag_config(
+    "jarvis_label",
+    foreground="#00ff66",
+    font=("Consolas", 12, "bold")
+)
+
+chat_box.tag_config(
+    "jarvis_text",
+    foreground="#dddddd"
+)
+
+chat_box.config(
+    state="disabled"
+)
+
+
+# ============================================================
+# BUTTON AREA
+# ============================================================
+
+button_frame = tk.Frame(
+    root,
+    bg="#050505"
+)
+
+button_frame.pack(
+    fill="x",
+    padx=20
+)
+
+
+def make_button(
+    parent,
+    text,
+    command
+):
+
+    button = tk.Button(
+        parent,
+        text=text,
+        command=command,
+        font=("Consolas", 10, "bold"),
+        bg="#071107",
+        fg="#00ff66",
+        activebackground="#0d3315",
+        activeforeground="#ffffff",
+        relief="flat",
+        bd=1,
+        padx=15,
+        pady=8,
+        cursor="hand2"
+    )
+
+    return button
+
+
+voice_button = make_button(
+    button_frame,
+    "🎤 VOICE",
+    voice_command
+)
+
+voice_button.pack(
+    side="left",
+    padx=4
+)
+
+
+wake_button = make_button(
+    button_frame,
+    "WAKE MODE: OFF",
+    toggle_wake_mode
+)
+
+wake_button.pack(
+    side="left",
+    padx=4
+)
+
+
+help_button = make_button(
+    button_frame,
+    "COMMANDS",
+    lambda: process_command("help")
+)
+
+help_button.pack(
+    side="left",
+    padx=4
+)
+
+
+clear_button = make_button(
+    button_frame,
+    "CLEAR CHAT",
+    lambda: clear_chat()
+)
+
+clear_button.pack(
+    side="left",
+    padx=4
+)
+
+
+# ============================================================
+# INPUT AREA
+# ============================================================
+
+input_frame = tk.Frame(
+    root,
+    bg="#050505"
+)
+
+input_frame.pack(
+    fill="x",
+    padx=20,
+    pady=15
+)
+
+
+prompt_label = tk.Label(
+    input_frame,
+    text="YOU >",
+    font=("Consolas", 12, "bold"),
+    bg="#050505",
+    fg="#00ff66"
+)
+
+prompt_label.pack(
+    side="left",
+    padx=(0, 8)
+)
+
+
+input_box = tk.Entry(
+    input_frame,
+    font=("Consolas", 13),
+    bg="#101010",
+    fg="#ffffff",
+    insertbackground="#00ff66",
+    relief="flat"
+)
+
+input_box.pack(
+    side="left",
+    fill="x",
+    expand=True,
+    ipady=9
+)
+
+input_box.bind(
+    "<Return>",
+    send_command
+)
+
+
+send_button = make_button(
+    input_frame,
+    "SEND",
+    send_command
+)
+
+send_button.pack(
+    side="left",
+    padx=(8, 0)
+)
+
+
+# ============================================================
+# CLEAR CHAT
+# ============================================================
+
+def clear_chat():
+
+    chat_box.config(
+        state="normal"
+    )
+
+    chat_box.delete(
+        "1.0",
+        tk.END
+    )
+
+    chat_box.config(
+        state="disabled"
+    )
+
+    display_jarvis(
+        "Chat cleared, Sir."
+    )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+load_memory()
+
+display_jarvis(
+    "Hello Sir."
+)
+
+display_jarvis(
+    "JARVIS is online and ready."
+)
+
+display_jarvis(
+    "Type a command or use the VOICE button."
+)
+
+update_status("Online")
+
+
+# ============================================================
+# START GUI
+# ============================================================
+
+try:
+
+    root.mainloop()
+
+except Exception as e:
+
+    logging.exception(e)
+
+    try:
+        messagebox.showerror(
+            "JARVIS Error",
+            str(e)
+        )
+    except Exception:
+        pass
